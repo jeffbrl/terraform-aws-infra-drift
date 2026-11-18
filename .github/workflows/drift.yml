@@ -44,53 +44,153 @@ jobs:
         id: plan
         run: |
           set +e
-          tofu plan -refresh-only -detailed-exitcode -no-color -out=drift.tfplan > plan-output.txt 2>&1
-          EXIT_CODE=$?
+          tofu plan -refresh-only -no-color -out=drift.tfplan > plan-output.txt 2>&1
+          PLAN_EXIT=$?
           set -e
 
           cat plan-output.txt
-          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          if [ "$PLAN_EXIT" -ne 0 ]; then
+            echo "exit_code=1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-          if [ "$EXIT_CODE" -eq 2 ]; then
+          tofu show -json drift.tfplan > drift-plan.json
+          DRIFT_COUNT=$(jq '[(.resource_drift // [])[], (.resource_changes // [])[]] | length' drift-plan.json)
+          echo "Managed resource drift count: $DRIFT_COUNT"
+
+          if [ "$DRIFT_COUNT" -gt 0 ]; then
             tofu show -no-color drift.tfplan > drift-plan.txt
-            tofu show -json drift.tfplan > drift-plan.json
+            echo "has_managed_drift=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_managed_drift=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Scan for Unmanaged VPC Resources
+        id: unmanaged
+        if: steps.plan.outputs.exit_code != '1'
+        run: |
+          tofu state pull > state.json
+          MANAGED_IDS=$(jq -r '
+            [.resources[]?
+              | select(.type | IN("aws_subnet", "aws_route_table", "aws_security_group", "aws_internet_gateway", "aws_nat_gateway", "aws_vpc_endpoint"))
+              | .instances[]?.attributes.id
+            ] | .[]' state.json | sort -u)
+
+          VPC_IDS=$(jq -r '[.resources[]? | select(.type == "aws_vpc") | .instances[]?.attributes.id] | .[]' state.json)
+
+          : > unmanaged-resources.txt
+          for vpc_id in $VPC_IDS; do
+            # Subnets
+            aws ec2 describe-subnets --region "$AWS_REGION" --filters "Name=vpc-id,Values=$vpc_id" \
+              --query 'Subnets[].{id:SubnetId,info:join(` `, [CidrBlock, AvailabilityZone])}' --output json \
+              | jq -r '.[] | "subnet\t\(.id)\t\(.info)"' >> live-resources.tsv
+
+            # Route tables (ignore AWS-created main route table unless managed)
+            aws ec2 describe-route-tables --region "$AWS_REGION" --filters "Name=vpc-id,Values=$vpc_id" \
+              --output json \
+              | jq -r '.RouteTables[] | select((any(.Associations[]?; .Main == true)) | not) | "route_table\t\(.RouteTableId)\tvpc=\(.VpcId)"' >> live-resources.tsv
+
+            # Security groups (ignore AWS-created default SG)
+            aws ec2 describe-security-groups --region "$AWS_REGION" --filters "Name=vpc-id,Values=$vpc_id" \
+              --output json \
+              | jq -r '.SecurityGroups[] | select(.GroupName != "default") | "security_group\t\(.GroupId)\t\(.GroupName)"' >> live-resources.tsv
+
+            # Internet gateways
+            aws ec2 describe-internet-gateways --region "$AWS_REGION" --filters "Name=attachment.vpc-id,Values=$vpc_id" \
+              --output json \
+              | jq -r '.InternetGateways[] | "internet_gateway\t\(.InternetGatewayId)\tvpc='"$vpc_id"'"' >> live-resources.tsv
+
+            # NAT gateways
+            aws ec2 describe-nat-gateways --region "$AWS_REGION" --filter "Name=vpc-id,Values=$vpc_id" "Name=state,Values=available,pending" \
+              --output json \
+              | jq -r '.NatGateways[] | "nat_gateway\t\(.NatGatewayId)\t\(.SubnetId)"' >> live-resources.tsv
+
+            # VPC endpoints
+            aws ec2 describe-vpc-endpoints --region "$AWS_REGION" --filters "Name=vpc-id,Values=$vpc_id" "Name=vpc-endpoint-state,Values=available,pending" \
+              --output json \
+              | jq -r '.VpcEndpoints[] | "vpc_endpoint\t\(.VpcEndpointId)\t\(.ServiceName)"' >> live-resources.tsv
+          done
+
+          if [ -f live-resources.tsv ]; then
+            while IFS=$'\t' read -r rtype rid rinfo; do
+              if ! echo "$MANAGED_IDS" | grep -qx "$rid"; then
+                echo "- \`$rtype\` \`$rid\` ($rinfo)" >> unmanaged-resources.txt
+              fi
+            done < live-resources.tsv
+          fi
+
+          if [ -s unmanaged-resources.txt ]; then
+            echo "Unmanaged VPC resources detected:"
+            cat unmanaged-resources.txt
+            echo "has_unmanaged=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No unmanaged VPC resources detected."
+            echo "has_unmanaged=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Evaluate Drift Result
+        id: result
+        run: |
+          if [ "${{ steps.plan.outputs.exit_code }}" = "1" ]; then
+            echo "exit_code=1" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.plan.outputs.has_managed_drift }}" = "true" ] || [ "${{ steps.unmanaged.outputs.has_unmanaged }}" = "true" ]; then
+            echo "exit_code=2" >> "$GITHUB_OUTPUT"
+          else
+            echo "exit_code=0" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Upload Drift Plan Artifacts
-        if: steps.plan.outputs.exit_code == '2'
+        if: steps.result.outputs.exit_code == '2'
         uses: actions/upload-artifact@v4
         with:
           name: drift-plan-${{ github.run_id }}
           path: |
             drift-plan.txt
             drift-plan.json
+            unmanaged-resources.txt
+          if-no-files-found: ignore
           retention-days: 14
 
       - name: Open or Update Drift Issue
-        if: steps.plan.outputs.exit_code == '2'
+        if: steps.result.outputs.exit_code == '2'
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const plan = fs.readFileSync('drift-plan.txt', 'utf8');
-            const maxLen = 60000;
-            const truncated = plan.length > maxLen ? plan.slice(0, maxLen) + '\n... (truncated, see workflow artifacts)' : plan;
-
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
-            const body = [
-              `OpenTofu detected infrastructure drift in \`${{ env.AWS_REGION }}\`.`,
+            const sections = [
+              `OpenTofu/AWS detected infrastructure drift in \`${{ env.AWS_REGION }}\`.`,
               ``,
               `**Workflow Run:** ${runUrl}`,
-              ``,
-              `<details>`,
-              `<summary>Refresh-only plan output</summary>`,
-              ``,
-              '```hcl',
-              truncated,
-              '```',
-              ``,
-              `</details>`,
-            ].join('\n');
+            ];
+
+            if (fs.existsSync('unmanaged-resources.txt')) {
+              const unmanaged = fs.readFileSync('unmanaged-resources.txt', 'utf8').trim();
+              if (unmanaged) {
+                sections.push('', '### Unmanaged VPC Resources (not in OpenTofu state)', '', unmanaged);
+              }
+            }
+
+            if (fs.existsSync('drift-plan.txt')) {
+              const plan = fs.readFileSync('drift-plan.txt', 'utf8');
+              const maxLen = 50000;
+              const truncated = plan.length > maxLen ? plan.slice(0, maxLen) + '\n... (truncated, see workflow artifacts)' : plan;
+              sections.push(
+                '',
+                '### Managed Resource Drift (`tofu plan -refresh-only`)',
+                '',
+                '<details>',
+                '<summary>Refresh-only plan output</summary>',
+                '',
+                '```hcl',
+                truncated,
+                '```',
+                '',
+                '</details>',
+              );
+            }
+
+            const body = sections.join('\n');
 
             const { data: issues } = await github.rest.issues.listForRepo({
               ...context.repo,
@@ -115,7 +215,7 @@ jobs:
             }
 
       - name: Close Drift Issue When Clean
-        if: steps.plan.outputs.exit_code == '0'
+        if: steps.result.outputs.exit_code == '0'
         uses: actions/github-script@v7
         with:
           script: |
@@ -141,7 +241,7 @@ jobs:
             }
 
       - name: Fail on Drift or Error
-        if: steps.plan.outputs.exit_code != '0'
+        if: steps.result.outputs.exit_code != '0'
         run: |
-          echo "Plan exited with code ${{ steps.plan.outputs.exit_code }}"
-          exit "${{ steps.plan.outputs.exit_code }}"
+          echo "Drift check exited with code ${{ steps.result.outputs.exit_code }}"
+          exit "${{ steps.result.outputs.exit_code }}"
